@@ -1,0 +1,375 @@
+import tkinter as tk
+from tkinter import messagebox, ttk
+from typing import List, Optional
+
+try:
+    import customtkinter as ctk
+except Exception:  # pragma: no cover
+    ctk = None
+
+from .accounting import process_transaction
+from .database import DatabaseManager
+from .security import hash_password
+
+
+class CashWalletApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("نظام محفظة نقدية")
+        self.db = DatabaseManager()
+        self.current_user = None
+        self.login_frame = None
+        self.main_frame = None
+        self.notebook = None
+        self._setup_login()
+
+    def _setup_login(self):
+        self.root.geometry("420x260")
+        self.root.configure(bg="#f3f4f6")
+        self.login_frame = tk.Frame(self.root, padx=24, pady=24, bg="#f3f4f6")
+        self.login_frame.pack(fill="both", expand=True)
+
+        title = tk.Label(self.login_frame, text="تسجيل الدخول", font=("Tahoma", 18, "bold"), bg="#f3f4f6", fg="#0b132b")
+        title.pack(pady=(0, 16))
+
+        tk.Label(self.login_frame, text="اسم المستخدم", bg="#f3f4f6").pack(anchor="w")
+        self.username_entry = tk.Entry(self.login_frame, width=28, font=("Tahoma", 12))
+        self.username_entry.pack(pady=(4, 10), fill="x")
+
+        tk.Label(self.login_frame, text="كلمة المرور", bg="#f3f4f6").pack(anchor="w")
+        self.password_entry = tk.Entry(self.login_frame, show="*", width=28, font=("Tahoma", 12))
+        self.password_entry.pack(pady=(4, 10), fill="x")
+
+        tk.Button(self.login_frame, text="دخول", width=16, command=self.login, bg="#1d4ed8", fg="white", font=("Tahoma", 11, "bold")).pack(pady=12)
+
+        self.username_entry.insert(0, "admin")
+        self.password_entry.insert(0, "Admin123!")
+
+    def login(self):
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get()
+        user = self.db.authenticate(username, password)
+        if user is None:
+            messagebox.showerror("خطأ", "بيانات الدخول غير صحيحة.")
+            return
+        self.current_user = user
+        self.login_frame.destroy()
+        self._build_main_ui()
+
+    def _build_main_ui(self):
+        self.root.geometry("1200x760")
+        self.main_frame = tk.Frame(self.root)
+        self.main_frame.pack(fill="both", expand=True)
+
+        top = tk.Frame(self.main_frame, pady=8, padx=10)
+        top.pack(fill="x")
+        tk.Label(top, text=f"مرحبًا: {self.current_user['username']} ({self.current_user['role']})", font=("Tahoma", 12, "bold")).pack(anchor="w")
+        tk.Button(top, text="تسجيل خروج", command=self.logout, bg="#ef4444", fg="white", font=("Tahoma", 10, "bold")).pack(anchor="e")
+
+        self.notebook = ttk.Notebook(self.main_frame)
+        self.notebook.pack(fill="both", expand=True)
+
+        self.dashboard_tab = tk.Frame(self.notebook)
+        self.wallets_tab = tk.Frame(self.notebook)
+        self.transactions_tab = tk.Frame(self.notebook)
+        self.reports_tab = tk.Frame(self.notebook)
+        self.users_tab = tk.Frame(self.notebook)
+        self.backup_tab = tk.Frame(self.notebook)
+
+        self.notebook.add(self.dashboard_tab, text="لوحة التحكم")
+        self.notebook.add(self.wallets_tab, text="المحافظ")
+        self.notebook.add(self.transactions_tab, text="المعاملات")
+        self.notebook.add(self.reports_tab, text="التقارير")
+        if self.current_user["role"] == "admin":
+            self.notebook.add(self.users_tab, text="الموظفين")
+            self.notebook.add(self.backup_tab, text="نسخ احتياطي")
+
+        self._build_dashboard()
+        self._build_wallets()
+        self._build_transactions()
+        self._build_reports()
+        if self.current_user["role"] == "admin":
+            self._build_users()
+            self._build_backup()
+
+    def logout(self):
+        self.current_user = None
+        self.main_frame.destroy()
+        self._setup_login()
+
+    def _build_dashboard(self):
+        stats = self.db.dashboard_snapshot()
+        cards = tk.Frame(self.dashboard_tab, padx=12, pady=10)
+        cards.pack(fill="x")
+
+        for title, value in [
+            ("إجمالي الرصيد", f"{stats['wallet_total']:.2f} جنيه"),
+            ("عدد المعاملات اليوم", str(stats['today_count'])),
+            ("إيراد اليوم", f"{stats['today_income']:.2f} جنيه"),
+            ("مصاريف اليوم", f"{stats['today_outgoing']:.2f} جنيه"),
+            ("العمولات", f"{stats['today_commissions']:.2f} جنيه"),
+        ]:
+            frame = tk.LabelFrame(cards, text=title, padx=10, pady=10)
+            frame.pack(side="left", fill="y", padx=6)
+            tk.Label(frame, text=value, font=("Tahoma", 14, "bold")).pack()
+
+        tree = ttk.Treeview(self.dashboard_tab, columns=("wallet", "balance"), show="headings")
+        tree.heading("wallet", text="المحفظة")
+        tree.heading("balance", text="الرصيد")
+        tree.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        for wallet in self.db.list_wallets():
+            tree.insert("", "end", values=(wallet["name"], f"{wallet['current_balance']:.2f} جنيه"))
+
+    def _build_wallets(self):
+        actions = tk.Frame(self.wallets_tab, pady=8)
+        actions.pack(fill="x")
+        tk.Button(actions, text="إضافة محفظة", command=self.add_wallet, bg="#2563eb", fg="white", font=("Tahoma", 10, "bold")).pack(side="left")
+
+        tree = ttk.Treeview(self.wallets_tab, columns=("id", "name", "provider", "identifier", "balance", "active"), show="headings")
+        tree.heading("id", text="ID")
+        tree.heading("name", text="الاسم")
+        tree.heading("provider", text="المزود")
+        tree.heading("identifier", text="المعرف")
+        tree.heading("balance", text="الرصيد")
+        tree.heading("active", text="نشط")
+        tree.pack(fill="both", expand=True, padx=12, pady=8)
+
+        self.wallet_tree = tree
+        self.refresh_wallets_table()
+
+    def refresh_wallets_table(self):
+        self.wallet_tree.delete(*self.wallet_tree.get_children())
+        for wallet in self.db.list_wallets():
+            self.wallet_tree.insert("", "end", values=(wallet["id"], wallet["name"], wallet["provider"], wallet["wallet_identifier"], f"{wallet['current_balance']:.2f} جنيه", "نعم" if wallet["active"] else "لا"))
+
+    def add_wallet(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("إضافة محفظة")
+        dialog.geometry("420x300")
+
+        fields = [
+            ("اسم المحفظة", "name"),
+            ("المزود", "provider"),
+            ("رقم الهاتف/المعرف", "identifier"),
+            ("الرصيد الافتتاحي", "opening_balance"),
+            ("ملاحظات", "notes"),
+        ]
+        entries = {}
+        for idx, (label, key) in enumerate(fields):
+            tk.Label(dialog, text=label).grid(row=idx, column=0, padx=8, pady=6, sticky="w")
+            entry = tk.Entry(dialog, width=28)
+            entry.grid(row=idx, column=1, padx=8, pady=6)
+            entries[key] = entry
+
+        def save():
+            try:
+                self.db.create_wallet(
+                    name=entries["name"].get(),
+                    provider=entries["provider"].get(),
+                    wallet_identifier=entries["identifier"].get(),
+                    opening_balance=float(entries["opening_balance"].get() or 0),
+                    active=True,
+                    notes=entries["notes"].get(),
+                )
+                self.refresh_wallets_table()
+                dialog.destroy()
+                messagebox.showinfo("تم", "تمت إضافة المحفظة بنجاح.")
+            except Exception as exc:  # pragma: no cover
+                messagebox.showerror("خطأ", str(exc))
+
+        tk.Button(dialog, text="حفظ", command=save, bg="#22c55e", fg="white").grid(row=100, column=1, pady=12)
+
+    def _build_transactions(self):
+        toolbar = tk.Frame(self.transactions_tab, pady=8)
+        toolbar.pack(fill="x")
+        tk.Button(toolbar, text="إضافة معاملة", command=self.add_transaction, bg="#16a34a", fg="white", font=("Tahoma", 10, "bold")).pack(side="left")
+
+        tree = ttk.Treeview(self.transactions_tab, columns=("id", "type", "amount", "source", "destination", "employee", "created"), show="headings")
+        tree.heading("id", text="ID")
+        tree.heading("type", text="النوع")
+        tree.heading("amount", text="المبلغ")
+        tree.heading("source", text="من")
+        tree.heading("destination", text="إلى")
+        tree.heading("employee", text="الموظف")
+        tree.heading("created", text="التاريخ")
+        tree.pack(fill="both", expand=True, padx=12, pady=8)
+        self.transaction_tree = tree
+        self.refresh_transactions_table()
+
+    def refresh_transactions_table(self):
+        self.transaction_tree.delete(*self.transaction_tree.get_children())
+        for tx in self.db.list_transactions(limit=100):
+            source = self.db.get_wallet_by_id(tx["source_wallet_id"])
+            destination = self.db.get_wallet_by_id(tx["destination_wallet_id"])
+            self.transaction_tree.insert(
+                "",
+                "end",
+                values=(
+                    tx["transaction_id"],
+                    tx["transaction_type"],
+                    f"{tx['principal_amount']:.2f} جنيه",
+                    source["name"] if source else "-",
+                    destination["name"] if destination else "-",
+                    tx["employee_name"] or "-",
+                    tx["created_at"][:16],
+                ),
+            )
+
+    def add_transaction(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("إضافة معاملة")
+        dialog.geometry("500x420")
+
+        wallet_names = {wallet["id"]: wallet["name"] for wallet in self.db.list_wallets()}
+        tx_types = [
+            "cash_deposit",
+            "cash_withdrawal",
+            "incoming_transfer",
+            "outgoing_transfer",
+            "internal_transfer",
+            "commission",
+            "balance_adjustment",
+        ]
+
+        tk.Label(dialog, text="نوع المعاملة").grid(row=0, column=0, padx=8, pady=6)
+        tx_type = tk.StringVar(value="cash_deposit")
+        tk.OptionMenu(dialog, tx_type, *tx_types).grid(row=0, column=1, padx=8, pady=6)
+
+        tk.Label(dialog, text="المحفظة المصدر").grid(row=1, column=0, padx=8, pady=6)
+        source_var = tk.StringVar(value="")
+        source_menu = tk.OptionMenu(dialog, source_var, *[str(k) for k in wallet_names.keys()])
+        source_menu.grid(row=1, column=1, padx=8, pady=6)
+
+        tk.Label(dialog, text="المحفظة الوجهة").grid(row=2, column=0, padx=8, pady=6)
+        dest_var = tk.StringVar(value="")
+        dest_menu = tk.OptionMenu(dialog, dest_var, *[str(k) for k in wallet_names.keys()])
+        dest_menu.grid(row=2, column=1, padx=8, pady=6)
+
+        tk.Label(dialog, text="المبلغ الرئيسي").grid(row=3, column=0, padx=8, pady=6)
+        amount_entry = tk.Entry(dialog)
+        amount_entry.grid(row=3, column=1, padx=8, pady=6)
+
+        tk.Label(dialog, text="العمولة").grid(row=4, column=0, padx=8, pady=6)
+        commission_entry = tk.Entry(dialog)
+        commission_entry.grid(row=4, column=1, padx=8, pady=6)
+
+        tk.Label(dialog, text="الرسوم الإضافية").grid(row=5, column=0, padx=8, pady=6)
+        fee_entry = tk.Entry(dialog)
+        fee_entry.grid(row=5, column=1, padx=8, pady=6)
+
+        tk.Label(dialog, text="المرجع").grid(row=6, column=0, padx=8, pady=6)
+        ref_entry = tk.Entry(dialog)
+        ref_entry.grid(row=6, column=1, padx=8, pady=6)
+
+        tk.Label(dialog, text="ملاحظات").grid(row=7, column=0, padx=8, pady=6)
+        notes_entry = tk.Entry(dialog, width=28)
+        notes_entry.grid(row=7, column=1, padx=8, pady=6)
+
+        def save():
+            try:
+                source_wallet = int(source_var.get()) if source_var.get() else None
+                dest_wallet = int(dest_var.get()) if dest_var.get() else None
+                if tx_type.get() == "cash_deposit":
+                    source_wallet = None
+                elif tx_type.get() == "incoming_transfer":
+                    source_wallet = None
+                elif tx_type.get() == "balance_adjustment" and self.current_user["role"] != "admin":
+                    raise PermissionError("تعديل الرصيد محجوز للمالك فقط.")
+
+                from .accounting import process_transaction
+                process_transaction(
+                    self.db,
+                    transaction_type=tx_type.get(),
+                    principal_amount=float(amount_entry.get() or 0),
+                    employee_user_id=self.current_user["id"],
+                    employee_name=self.current_user["username"],
+                    source_wallet_id=source_wallet,
+                    destination_wallet_id=dest_wallet,
+                    commission_amount=float(commission_entry.get() or 0),
+                    fee_amount=float(fee_entry.get() or 0),
+                    customer_reference=ref_entry.get() or None,
+                    notes=notes_entry.get() or "",
+                    allow_negative=False,
+                )
+                self.refresh_transactions_table()
+                self.refresh_dashboard_view()
+                dialog.destroy()
+                messagebox.showinfo("تم", "تم حفظ المعاملة بنجاح.")
+            except Exception as exc:  # pragma: no cover
+                messagebox.showerror("خطأ", str(exc))
+
+        tk.Button(dialog, text="حفظ", command=save, bg="#16a34a", fg="white").grid(row=8, column=1, pady=12)
+
+    def _build_reports(self):
+        tk.Label(self.reports_tab, text="التقارير", font=("Tahoma", 16, "bold")).pack(pady=10)
+
+        summary = self.db.dashboard_snapshot()
+        tk.Label(self.reports_tab, text=f"إجمالي الرصيد: {summary['wallet_total']:.2f} جنيه").pack(anchor="w", padx=12)
+        tk.Label(self.reports_tab, text=f"إيراد اليوم: {summary['today_income']:.2f} جنيه").pack(anchor="w", padx=12)
+        tk.Label(self.reports_tab, text=f"نفقات اليوم: {summary['today_outgoing']:.2f} جنيه").pack(anchor="w", padx=12)
+        tk.Label(self.reports_tab, text=f"العمولات: {summary['today_commissions']:.2f} جنيه").pack(anchor="w", padx=12)
+
+    def refresh_dashboard_view(self):
+        for child in self.dashboard_tab.winfo_children():
+            child.destroy()
+        self._build_dashboard()
+
+    def _build_users(self):
+        toolbar = tk.Frame(self.users_tab)
+        toolbar.pack(fill="x", padx=10, pady=10)
+        tk.Button(toolbar, text="إضافة موظف", command=self.add_user, bg="#2563eb", fg="white").pack(side="left")
+
+        tree = ttk.Treeview(self.users_tab, columns=("id", "username", "role", "active"), show="headings")
+        tree.heading("id", text="ID")
+        tree.heading("username", text="اسم المستخدم")
+        tree.heading("role", text="الدور")
+        tree.heading("active", text="نشط")
+        tree.pack(fill="both", expand=True, padx=10)
+        self.user_tree = tree
+        self.refresh_users_table()
+
+    def refresh_users_table(self):
+        self.user_tree.delete(*self.user_tree.get_children())
+        for user in self.db.user_list():
+            self.user_tree.insert("", "end", values=(user["id"], user["username"], user["role"], "نعم" if user["active"] else "لا"))
+
+    def add_user(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("إضافة موظف")
+        dialog.geometry("350x220")
+        tk.Label(dialog, text="اسم المستخدم").grid(row=0, column=0, padx=8, pady=6)
+        user = tk.Entry(dialog)
+        user.grid(row=0, column=1, padx=8, pady=6)
+        tk.Label(dialog, text="كلمة المرور").grid(row=1, column=0, padx=8, pady=6)
+        pwd = tk.Entry(dialog, show="*")
+        pwd.grid(row=1, column=1, padx=8, pady=6)
+
+        def save():
+            try:
+                self.db.create_user(user.get(), pwd.get(), role="employee", active=True)
+                self.refresh_users_table()
+                dialog.destroy()
+                messagebox.showinfo("تم", "تم إضافة الموظف بنجاح.")
+            except Exception as exc:  # pragma: no cover
+                messagebox.showerror("خطأ", str(exc))
+
+        tk.Button(dialog, text="حفظ", command=save, bg="#2563eb", fg="white").grid(row=2, column=1, pady=12)
+
+    def _build_backup(self):
+        tk.Button(self.backup_tab, text="إنشاء نسخة احتياطية", command=self.create_backup, bg="#0ea5e9", fg="white").pack(pady=20)
+
+    def create_backup(self):
+        from .backup import create_backup as make_backup
+        path = make_backup(self.db.db_path)
+        self.db.create_backup_record(path)
+        messagebox.showinfo("تم", f"تم إنشاء النسخة الاحتياطية في\n{path}")
+
+
+def main():
+    root = tk.Tk()
+    app = CashWalletApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

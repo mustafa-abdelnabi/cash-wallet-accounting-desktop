@@ -1,0 +1,118 @@
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from cash_wallet_app.accounting import process_transaction
+from cash_wallet_app.backup import create_backup, restore_backup
+from cash_wallet_app.database import DatabaseManager
+
+
+def test_internal_transfer_updates_both_wallets_once(tmp_path):
+    db_path = tmp_path / "wallet_test.db"
+    db = DatabaseManager(db_path)
+    db.create_wallet("A", "Vodafone", "0101", opening_balance=1000)
+    db.create_wallet("B", "Orange", "0102", opening_balance=300)
+
+    user = db.get_user_by_username("admin")
+    tx = process_transaction(
+        db,
+        transaction_type="internal_transfer",
+        principal_amount=200,
+        employee_user_id=user["id"],
+        employee_name=user["username"],
+        source_wallet_id=1,
+        destination_wallet_id=2,
+        allow_negative=False,
+    )
+
+    assert tx["status"] == "posted"
+    assert db.get_wallet_by_id(1)["current_balance"] == 800.0
+    assert db.get_wallet_by_id(2)["current_balance"] == 500.0
+
+
+def test_balance_adjustment_requires_admin(tmp_path):
+    db_path = tmp_path / "wallet_permissions.db"
+    db = DatabaseManager(db_path)
+    db.create_wallet("A", "Vodafone", "0101", opening_balance=100)
+    admin = db.get_user_by_username("admin")
+    db.create_user("emp1", "Aa123456!", role="employee", active=True)
+    employee = db.get_user_by_username("emp1")
+    with pytest.raises(PermissionError):
+        process_transaction(
+            db,
+            transaction_type="balance_adjustment",
+            principal_amount=50,
+            employee_user_id=employee["id"],
+            employee_name=employee["username"],
+            source_wallet_id=1,
+            allow_negative=False,
+        )
+    result = process_transaction(
+        db,
+        transaction_type="balance_adjustment",
+        principal_amount=50,
+        employee_user_id=admin["id"],
+        employee_name=admin["username"],
+        source_wallet_id=1,
+        allow_negative=False,
+    )
+    assert result["status"] == "posted"
+
+
+def test_duplicate_transaction_is_flagged(tmp_path):
+    db_path = tmp_path / "wallet_duplicate.db"
+    db = DatabaseManager(db_path)
+    db.create_wallet("A", "Vodafone", "0101", opening_balance=100)
+    admin = db.get_user_by_username("admin")
+    process_transaction(
+        db,
+        transaction_type="cash_deposit",
+        principal_amount=10,
+        employee_user_id=admin["id"],
+        employee_name=admin["username"],
+        destination_wallet_id=1,
+        allow_negative=False,
+        duplicate_check_key="same-key",
+    )
+    with pytest.raises(ValueError):
+        process_transaction(
+            db,
+            transaction_type="cash_deposit",
+            principal_amount=10,
+            employee_user_id=admin["id"],
+            employee_name=admin["username"],
+            destination_wallet_id=1,
+            allow_negative=False,
+            duplicate_check_key="same-key",
+        )
+
+
+def test_backup_and_restore_work(tmp_path):
+    db_path = tmp_path / "wallet_backup.db"
+    db = DatabaseManager(db_path)
+    db.create_wallet("A", "Vodafone", "0101", opening_balance=250)
+    backup_file = create_backup(db_path, tmp_path)
+    assert Path(backup_file).exists()
+
+    db2 = DatabaseManager(tmp_path / "wallet_restore.db")
+    restore_backup(tmp_path / "wallet_restore.db", backup_file)
+    loaded = DatabaseManager(tmp_path / "wallet_restore.db")
+    assert loaded.get_wallet_by_id(1)["current_balance"] == 250.0
+
+
+def test_negative_balance_blocked_by_default(tmp_path):
+    db_path = tmp_path / "wallet_negative.db"
+    db = DatabaseManager(db_path)
+    db.create_wallet("A", "Vodafone", "0101", opening_balance=20)
+    admin = db.get_user_by_username("admin")
+    with pytest.raises(ValueError):
+        process_transaction(
+            db,
+            transaction_type="cash_withdrawal",
+            principal_amount=30,
+            employee_user_id=admin["id"],
+            employee_name=admin["username"],
+            source_wallet_id=1,
+            allow_negative=False,
+        )

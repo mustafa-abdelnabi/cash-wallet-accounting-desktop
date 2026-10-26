@@ -1,0 +1,375 @@
+import sqlite3
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from .config import APP_NAME, BACKUP_DIR, DB_PATH, DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME
+from .security import hash_password, verify_password
+
+
+class DatabaseManager:
+    """Lightweight SQLite data layer for wallet accounting."""
+
+    def __init__(self, db_path: str | Path | None = None):
+        self.db_path = Path(db_path) if db_path is not None else DB_PATH
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.init_db()
+
+    def connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def init_db(self) -> None:
+        conn = self.connect()
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS settings (
+                    name TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('admin','employee')),
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_login TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS wallets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    provider TEXT,
+                    wallet_identifier TEXT,
+                    opening_balance REAL NOT NULL DEFAULT 0,
+                    current_balance REAL NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    notes TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    transaction_id TEXT NOT NULL UNIQUE,
+                    transaction_type TEXT NOT NULL,
+                    source_wallet_id INTEGER,
+                    destination_wallet_id INTEGER,
+                    principal_amount REAL NOT NULL,
+                    commission_amount REAL NOT NULL DEFAULT 0,
+                    fee_amount REAL NOT NULL DEFAULT 0,
+                    customer_reference TEXT,
+                    notes TEXT,
+                    created_by_user_id INTEGER,
+                    employee_name TEXT,
+                    status TEXT NOT NULL DEFAULT 'posted',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    correction_history TEXT NOT NULL DEFAULT '',
+                    reason TEXT,
+                    is_duplicate INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (source_wallet_id) REFERENCES wallets(id),
+                    FOREIGN KEY (destination_wallet_id) REFERENCES wallets(id),
+                    FOREIGN KEY (created_by_user_id) REFERENCES users(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS audit_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    action TEXT NOT NULL,
+                    details TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS backups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+            conn.commit()
+            self.ensure_defaults()
+        finally:
+            conn.close()
+
+    def ensure_defaults(self) -> None:
+        if self.get_user_by_username(DEFAULT_ADMIN_USERNAME) is None:
+            self.create_user(
+                username=DEFAULT_ADMIN_USERNAME,
+                password=DEFAULT_ADMIN_PASSWORD,
+                role="admin",
+                active=True,
+            )
+        self.set_setting("app_name", APP_NAME)
+        self.set_setting("allow_negative_balances", "0")
+
+    def set_setting(self, name: str, value: str) -> None:
+        conn = self.connect()
+        try:
+            conn.execute(
+                "INSERT INTO settings(name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+                (name, str(value)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_setting(self, name: str, default: Optional[str] = None) -> Optional[str]:
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT value FROM settings WHERE name = ?", (name,)).fetchone()
+            if row is None:
+                return default
+            return row["value"]
+        finally:
+            conn.close()
+
+    def create_user(
+        self,
+        username: str,
+        password: str,
+        role: str = "employee",
+        active: bool = True,
+    ) -> Dict[str, Any]:
+        username = (username or "").strip()
+        if not username:
+            raise ValueError("اسم المستخدم مطلوب.")
+        conn = self.connect()
+        try:
+            user_id = conn.execute(
+                "INSERT INTO users(username, password_hash, role, active) VALUES (?, ?, ?, ?)",
+                (username, hash_password(password), role, 1 if active else 0),
+            ).lastrowid
+            conn.commit()
+            return {"id": user_id, "username": username, "role": role, "active": int(active)}
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("اسم المستخدم موجود بالفعل.") from exc
+        finally:
+            conn.close()
+
+    def get_user_by_username(self, username: str) -> Optional[sqlite3.Row]:
+        conn = self.connect()
+        try:
+            return conn.execute(
+                "SELECT * FROM users WHERE username = ?",
+                (username,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def get_user_by_id(self, user_id: int) -> Optional[sqlite3.Row]:
+        conn = self.connect()
+        try:
+            return conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        finally:
+            conn.close()
+
+    def authenticate(self, username: str, password: str) -> Optional[sqlite3.Row]:
+        user = self.get_user_by_username(username)
+        if user is None:
+            return None
+        if not user["active"]:
+            return None
+        if not verify_password(password, user["password_hash"]):
+            return None
+        conn = self.connect()
+        try:
+            conn.execute(
+                "UPDATE users SET last_login = ? WHERE id = ?",
+                (datetime.utcnow().isoformat(timespec="seconds"), user["id"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return self.get_user_by_id(user["id"])
+
+    def create_wallet(
+        self,
+        name: str,
+        provider: str,
+        wallet_identifier: str,
+        opening_balance: float = 0.0,
+        active: bool = True,
+        notes: str = "",
+    ) -> Dict[str, Any]:
+        if not name or not name.strip():
+            raise ValueError("اسم المحفظة مطلوب.")
+        conn = self.connect()
+        try:
+            opening = float(opening_balance or 0)
+            current = opening
+            wallet_id = conn.execute(
+                """
+                INSERT INTO wallets(name, provider, wallet_identifier, opening_balance, current_balance, active, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (name.strip(), provider or "", wallet_identifier or "", opening, current, 1 if active else 0, notes or ""),
+            ).lastrowid
+            conn.commit()
+            return self.get_wallet_by_id(wallet_id)
+        finally:
+            conn.close()
+
+    def get_wallet_by_id(self, wallet_id: int) -> Optional[sqlite3.Row]:
+        conn = self.connect()
+        try:
+            return conn.execute("SELECT * FROM wallets WHERE id = ?", (wallet_id,)).fetchone()
+        finally:
+            conn.close()
+
+    def list_wallets(self) -> List[sqlite3.Row]:
+        conn = self.connect()
+        try:
+            return conn.execute(
+                "SELECT * FROM wallets ORDER BY active DESC, name ASC"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def update_wallet_balance(self, wallet_id: int, delta: float) -> None:
+        conn = self.connect()
+        try:
+            conn.execute(
+                "UPDATE wallets SET current_balance = current_balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (float(delta), wallet_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_transactions(self, limit: int = 50) -> List[sqlite3.Row]:
+        conn = self.connect()
+        try:
+            return conn.execute(
+                "SELECT * FROM transactions ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def get_transaction_by_id(self, transaction_id: str) -> Optional[sqlite3.Row]:
+        conn = self.connect()
+        try:
+            return conn.execute("SELECT * FROM transactions WHERE transaction_id = ?", (transaction_id,)).fetchone()
+        finally:
+            conn.close()
+
+    def record_audit(self, user_id: Optional[int], action: str, details: str) -> None:
+        conn = self.connect()
+        try:
+            conn.execute(
+                "INSERT INTO audit_logs(user_id, action, details) VALUES (?, ?, ?)",
+                (user_id, action, details),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_audit_logs(self, limit: int = 50) -> List[sqlite3.Row]:
+        conn = self.connect()
+        try:
+            return conn.execute(
+                "SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def create_backup_record(self, filename: str) -> None:
+        conn = self.connect()
+        try:
+            conn.execute("INSERT INTO backups(filename) VALUES (?)", (filename,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_backups(self) -> List[sqlite3.Row]:
+        conn = self.connect()
+        try:
+            return conn.execute("SELECT * FROM backups ORDER BY created_at DESC").fetchall()
+        finally:
+            conn.close()
+
+    def total_balance(self) -> float:
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT COALESCE(SUM(current_balance), 0) as total FROM wallets WHERE active = 1").fetchone()
+            return float(row["total"] or 0)
+        finally:
+            conn.close()
+
+    def dashboard_snapshot(self) -> Dict[str, Any]:
+        conn = self.connect()
+        try:
+            wallets = conn.execute("SELECT * FROM wallets WHERE active = 1 ORDER BY name").fetchall()
+            wallet_total = sum(float(w["current_balance"]) for w in wallets)
+            today = conn.execute(
+                "SELECT COUNT(*) as count, COALESCE(SUM(CASE WHEN principal_amount >= 0 THEN principal_amount ELSE 0 END), 0) as income, COALESCE(SUM(CASE WHEN principal_amount < 0 THEN ABS(principal_amount) ELSE 0 END), 0) as outgoing, COALESCE(SUM(commission_amount), 0) as commissions FROM transactions WHERE date(created_at) = date('now')"
+            ).fetchone()
+            latest = conn.execute(
+                "SELECT * FROM transactions ORDER BY created_at DESC LIMIT 10"
+            ).fetchall()
+            return {
+                "wallet_total": float(wallet_total),
+                "wallet_count": len(wallets),
+                "today_count": int(today["count"] or 0),
+                "today_income": float(today["income"] or 0),
+                "today_outgoing": float(today["outgoing"] or 0),
+                "today_commissions": float(today["commissions"] or 0),
+                "latest_transactions": latest,
+            }
+        finally:
+            conn.close()
+
+    def user_list(self) -> List[sqlite3.Row]:
+        conn = self.connect()
+        try:
+            return conn.execute("SELECT * FROM users ORDER BY id ASC").fetchall()
+        finally:
+            conn.close()
+
+    def update_user_status(self, user_id: int, active: bool) -> None:
+        conn = self.connect()
+        try:
+            conn.execute("UPDATE users SET active = ? WHERE id = ?", (1 if active else 0, user_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def delete_user(self, user_id: int) -> None:
+        conn = self.connect()
+        try:
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def create_default_admin_if_needed(self) -> None:
+        if self.get_user_by_username(DEFAULT_ADMIN_USERNAME) is None:
+            self.create_user(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD, role="admin", active=True)
+
+    def get_report(self, start_date: str, end_date: str, wallet_id: Optional[int] = None, employee_id: Optional[int] = None, transaction_type: Optional[str] = None) -> List[sqlite3.Row]:
+        conn = self.connect()
+        try:
+            query = "SELECT * FROM transactions WHERE date(created_at) BETWEEN date(?) AND date(?)"
+            params: List[Any] = [start_date, end_date]
+            if wallet_id is not None:
+                query += " AND (source_wallet_id = ? OR destination_wallet_id = ?)"
+                params.extend([wallet_id, wallet_id])
+            if employee_id is not None:
+                query += " AND created_by_user_id = ?"
+                params.append(employee_id)
+            if transaction_type:
+                query += " AND transaction_type = ?"
+                params.append(transaction_type)
+            query += " ORDER BY created_at DESC"
+            return conn.execute(query, params).fetchall()
+        finally:
+            conn.close()
